@@ -1142,15 +1142,17 @@ body::after { width: 280px; height: 280px; left: -140px; bottom: 8%; }
   border-color: rgba(71,190,194,.4) !important;
 }
 
-/* Shimmer on hover */
-.fh-stat-card::after {
-  content: '';
-  position: absolute; top: 0; left: 0; right: 0; height: 2px;
-  background: linear-gradient(90deg, transparent, var(--fh-teal), transparent);
-  opacity: 0; border-radius: 18px 18px 0 0;
-  transition: opacity .25s ease;
+/* Shimmer on hover — solo desktop, no pisa el ::after móvil de "Toca para ver" */
+@media (min-width: 761px) {
+  .fh-stat-card::after {
+    content: '';
+    position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--fh-teal), transparent);
+    opacity: 0; border-radius: 18px 18px 0 0;
+    transition: opacity .25s ease;
+  }
+  .fh-stat-card:hover::after { opacity: 1; }
 }
-.fh-stat-card:hover::after { opacity: 1; }
 
 /* ===== MAIN TABS PREMIUM ===== */
 .fh-maintab {
@@ -1643,7 +1645,11 @@ function getSessionNum(b) {
   const raw = pick(b, ['Número de sesión', 'Numero de sesion', 'sesion'], { consume: false });
   if (raw == null || raw === '') return NaN;
   const m = String(raw).match(/(\d+)/);
-  return m ? parseInt(m[1], 10) : NaN;
+  if (!m) return NaN;
+  const n = parseInt(m[1], 10);
+  // Solo retorna válido si está en el rango 1-9 (número de sesión real)
+  // Si el campo contiene la cédula u otro número grande, devuelve NaN
+  return (n >= 1 && n <= 9) ? n : NaN;
 }
 
 function el(tag, opts = {}, ...children) {
@@ -2045,13 +2051,44 @@ function renderBitacoras() {
 
   document.getElementById('bitas-count').textContent = data.bitacoras.length;
 
-  const sessionsWithData = new Set();
-  data.bitacoras.forEach(b => {
+  // Verificar si alguna bitácora tiene número de sesión válido (1-9)
+  // Si ninguna lo tiene, asignar posición ordinal: 1ª bitácora = Sesión 1, etc.
+  const hasValidNums = data.bitacoras.some(b => {
     const n = getSessionNum(b);
+    return !isNaN(n) && n >= 1 && n <= 9;
+  });
+
+  // Mapa: número de sesión → bitácora
+  if (!hasValidNums && data.bitacoras.length > 0) {
+    // Asignación ordinal: la 1ª bitácora recibe sesión 1, la 2ª sesión 2, etc.
+    data.bitacoras.forEach((b, idx) => {
+      b.__sessionFallback = idx + 1;
+    });
+  }
+
+  function resolveSessionNum(b, idx) {
+    if (b.__sessionFallback != null) return b.__sessionFallback;
+    const n = getSessionNum(b);
+    return (!isNaN(n) && n >= 1 && n <= 9) ? n : (idx + 1);
+  }
+
+  const sessionsWithData = new Set();
+  data.bitacoras.forEach((b, idx) => {
+    const n = resolveSessionNum(b, idx);
     if (n >= 1 && n <= 3) sessionsWithData.add(n);
   });
 
-  for (let i = 1; i <= 3; i++) {
+  // Guardar mapa sesión→bitácora para selectBitaSession
+  window._bitaSessionMap = {};
+  data.bitacoras.forEach((b, idx) => {
+    const n = resolveSessionNum(b, idx);
+    if (!window._bitaSessionMap[n]) window._bitaSessionMap[n] = b;
+  });
+
+  const maxSessions = Math.max(3, data.bitacoras.length);
+  const tabCount = Math.min(maxSessions, 3);
+
+  for (let i = 1; i <= tabCount; i++) {
     const tab = el('button', {
       class: 'fh-bita-tab' + (sessionsWithData.has(i) ? ' has-data' : ''),
       attrs: { 'data-session': i }
@@ -2062,9 +2099,9 @@ function renderBitacoras() {
     tabsEl.appendChild(tab);
   }
 
-  const first = data.bitacoras[0];
-  const initialNum = first ? (getSessionNum(first) || 1) : 1;
-  selectBitaSession(initialNum);
+  // Seleccionar la primera sesión con datos, o la 1 por defecto
+  const firstWithData = [...sessionsWithData].sort((a,b)=>a-b)[0] || 1;
+  selectBitaSession(firstWithData);
 }
 
 function bitaSection(icon, title, fields, openByDefault = true) {
@@ -2118,7 +2155,9 @@ function selectBitaSession(num) {
     t.classList.toggle('active', parseInt(t.dataset.session) === num);
   });
 
-  const bita = data.bitacoras.find(b => getSessionNum(b) === num);
+  // Usar mapa si existe (fallback ordinal), si no buscar por número de sesión
+  const bita = (window._bitaSessionMap && window._bitaSessionMap[num])
+    || data.bitacoras.find(b => getSessionNum(b) === num);
   const content = document.getElementById('bita-content');
   content.innerHTML = '';
 
