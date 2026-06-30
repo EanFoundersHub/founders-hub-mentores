@@ -1622,41 +1622,52 @@ function norm(s) {
     .replace(/\s+/g, ' ').trim();
 }
 
-function pick(obj, keywords, options = {}) {
+function hasValue(value) {
+  return value !== '' && value != null && String(value).trim() !== '';
+}
+
+// Microsoft Forms/Excel agrega sufijos cuando hay preguntas con el mismo nombre.
+// Esta función revisa TODAS las coincidencias y devuelve la primera que tenga respuesta,
+// en vez de quedarse atrapada en la primera columna vacía. Una pequeña cortesía hacia Excel.
+function findMatchingEntry(obj, keywords) {
   if (!obj) return null;
   const entries = Object.entries(obj);
+
   for (const kw of keywords) {
     const nkw = norm(kw);
-    const hit = entries.find(([k]) => norm(k) === nkw);
-    if (hit && hit[1] !== '' && hit[1] != null) {
-      if (options.consume !== false) data.consumedKeys.add(hit[0]);
-      return hit[1];
-    }
+    const exact = entries.find(([k, v]) => norm(k) === nkw && hasValue(v));
+    if (exact) return exact;
   }
+
   for (const kw of keywords) {
     const nkw = norm(kw);
-    const hit = entries.find(([k]) => norm(k).includes(nkw));
-    if (hit && hit[1] !== '' && hit[1] != null) {
-      if (options.consume !== false) data.consumedKeys.add(hit[0]);
-      return hit[1];
-    }
+    const partial = entries.find(([k, v]) => norm(k).includes(nkw) && hasValue(v));
+    if (partial) return partial;
   }
+
   return null;
 }
 
+function pick(obj, keywords, options = {}) {
+  const hit = findMatchingEntry(obj, keywords);
+  if (!hit) return null;
+  if (options.consume !== false) data.consumedKeys.add(hit[0]);
+  return hit[1];
+}
+
 function pickAndConsume(obj, keywords) {
-  if (!obj) return null;
-  const entries = Object.entries(obj);
-  for (const kw of keywords) {
-    const nkw = norm(kw);
-    let hit = entries.find(([k]) => norm(k) === nkw);
-    if (!hit) hit = entries.find(([k]) => norm(k).includes(nkw));
-    if (hit) {
-      data.consumedKeys.add(hit[0]);
-      return hit[1] !== '' && hit[1] != null ? hit[1] : null;
-    }
-  }
-  return null;
+  const hit = findMatchingEntry(obj, keywords);
+  if (!hit) return null;
+  data.consumedKeys.add(hit[0]);
+  return hit[1];
+}
+
+function pickAll(obj, keywords) {
+  if (!obj) return [];
+  const normalizedKeywords = keywords.map(norm);
+  return Object.entries(obj)
+    .filter(([key, value]) => hasValue(value) && normalizedKeywords.some(kw => norm(key).includes(kw)))
+    .map(([key, value]) => ({ key, value }));
 }
 
 function splitOptions(text) {
@@ -1684,6 +1695,171 @@ function getSessionNum(b) {
   // Solo retorna válido si está en el rango 1-9 (número de sesión real)
   // Si el campo contiene la cédula u otro número grande, devuelve NaN
   return (n >= 1 && n <= 9) ? n : NaN;
+}
+
+
+function parseDateForSort(value) {
+  if (!hasValue(value)) return null;
+  const raw = String(value).trim();
+
+  // Número de serie de Excel.
+  const serial = Number(raw.replace(',', '.'));
+  if (Number.isFinite(serial) && serial > 1000 && serial < 60000) {
+    const excelEpoch = Date.UTC(1899, 11, 30);
+    return excelEpoch + serial * 86400000;
+  }
+
+  // dd/mm/yyyy o dd-mm-yyyy, con hora opcional.
+  let match = raw.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{2,4})(?:[ T,]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+  if (match) {
+    let [, d, m, y, hh = '0', mm = '0', ss = '0'] = match;
+    if (y.length === 2) y = String(2000 + Number(y));
+    const stamp = Date.UTC(Number(y), Number(m) - 1, Number(d), Number(hh), Number(mm), Number(ss));
+    return Number.isNaN(stamp) ? null : stamp;
+  }
+
+  const parsed = Date.parse(raw);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function getBitacoraDateValue(row) {
+  const candidates = [
+    'Fecha de la sesión',
+    'Fecha de la sesion',
+    'Completion time',
+    'Hora de finalización',
+    'Hora de finalizacion',
+    'Submission time',
+    'Start time',
+    'Fecha de envío',
+    'Fecha de envio'
+  ];
+  for (const key of candidates) {
+    const value = pick(row, [key], { consume: false });
+    const parsed = parseDateForSort(value);
+    if (parsed != null) return parsed;
+  }
+  return null;
+}
+
+function getRowSequence(row, fallbackIndex) {
+  const raw = pick(row, ['ID', 'Response Id', 'Id. de respuesta', 'Identificador de respuesta'], { consume: false });
+  const num = Number(String(raw || '').replace(/[^\d.-]/g, ''));
+  return Number.isFinite(num) ? num : fallbackIndex;
+}
+
+function prepareBitacoras(rows, cedula) {
+  const normalizedCedula = cleanCedula(cedula);
+  const prepared = (Array.isArray(rows) ? rows : [])
+    .map((row, index) => ({ row: { ...row }, index }))
+    .filter(item => {
+      const rowCedula = cleanCedula(pick(item.row, ['Número de cédula', 'Numero de cedula', 'Cédula', 'Cedula'], { consume: false }));
+      // El flujo ya filtra por cédula. Si la columna no viene, conservamos la fila.
+      return !normalizedCedula || !rowCedula || rowCedula === normalizedCedula;
+    });
+
+  prepared.sort((a, b) => {
+    const dateA = getBitacoraDateValue(a.row);
+    const dateB = getBitacoraDateValue(b.row);
+    if (dateA != null && dateB != null && dateA !== dateB) return dateA - dateB;
+    if (dateA != null && dateB == null) return -1;
+    if (dateA == null && dateB != null) return 1;
+
+    const seqA = getRowSequence(a.row, a.index);
+    const seqB = getRowSequence(b.row, b.index);
+    if (seqA !== seqB) return seqA - seqB;
+    return a.index - b.index;
+  });
+
+  // La sesión ya no depende de una pregunta del Forms. Se deriva del historial real
+  // de esa cédula: primer registro = Sesión 1, segundo = Sesión 2, tercero = Sesión 3.
+  return prepared.map((item, index) => ({
+    ...item.row,
+    __sessionResolved: index + 1,
+    __sourceIndex: item.index
+  }));
+}
+
+function getResolvedSessionNum(row, fallbackIndex = 0) {
+  const resolved = Number(row && row.__sessionResolved);
+  if (Number.isFinite(resolved) && resolved >= 1) return resolved;
+  return fallbackIndex + 1;
+}
+
+function getProcessType(row) {
+  return pick(row, [
+    'Qué tipo de proceso se realizará con el fundador emprendedor',
+    'Que tipo de proceso se realizara con el fundador emprendedor',
+    'Tipo de proceso'
+  ], { consume: false });
+}
+
+function getComponent(row) {
+  const specialized = pick(row, [
+    'Sección Asesorías Especializada',
+    'Seccion Asesorias Especializada',
+    'Seleccione el componente de la asesoría especializada a brindar',
+    'En qué componente se centró la asesoría',
+    'En que componente se centro la asesoria',
+    'Componente trabajado'
+  ], { consume: false });
+
+  if (hasValue(specialized)) return specialized;
+
+  const processType = getProcessType(row);
+  if (hasValue(processType) && norm(processType).includes('diagnostico')) return 'Diagnóstico complementario';
+  return processType;
+}
+
+function collectPriorities(row) {
+  if (!row) return null;
+  const stems = [
+    'de acuerdo con el diagnostico y la priorizacion realizada',
+    'prioridad 1',
+    'prioridad 2',
+    'prioridad 3'
+  ];
+  const matches = pickAll(row, stems);
+  const rows = [];
+
+  matches.forEach(({ key, value }) => {
+    const normalizedKey = norm(key);
+    let area = key;
+    const dashParts = String(key).split(/[-–—]/).map(s => s.trim()).filter(Boolean);
+    if (dashParts.length > 1) area = dashParts[dashParts.length - 1];
+    if (normalizedKey.includes('prioridad 1') || normalizedKey.includes('prioridad 2') || normalizedKey.includes('prioridad 3')) {
+      area = key;
+    }
+    rows.push(`${area}: ${value}`);
+  });
+
+  const other = pick(row, [
+    'Si consideras que hay Otro, componente prioritario a abordar',
+    'Otro componente prioritario a abordar'
+  ], { consume: false });
+  if (hasValue(other)) rows.push(`Otro componente: ${other}`);
+
+  return rows.length ? rows.join('\n') : null;
+}
+
+function getTranscriptionLink(row) {
+  return pick(row, [
+    'Si cuentas con una transcripción o notas de la sesión',
+    'Si cuentas con una transcripcion o notas de la sesion',
+    'comparte el enlace del documento',
+    'Transcripción',
+    'Transcripcion'
+  ], { consume: false });
+}
+
+function isLikelyUrl(value) {
+  if (!hasValue(value)) return false;
+  try {
+    const url = new URL(String(value).trim());
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch (_) {
+    return false;
+  }
 }
 
 function el(tag, opts = {}, ...children) {
@@ -1771,13 +1947,13 @@ queryForm.addEventListener('submit', async (event) => {
 
     data = {
       prediagnostico: prediagRows[0] || null,
-      bitacoras: bitacoraRows,
+      bitacoras: [],
       cedula: result.cedula_recibida || cedula,
       filename: null,
       consumedKeys: new Set()
     };
 
-    data.bitacoras.sort((a, b) => (getSessionNum(a) || 0) - (getSessionNum(b) || 0));
+    data.bitacoras = prepareBitacoras(bitacoraRows, data.cedula);
     renderDashboard();
     toast(`Consulta cargada: ${data.bitacoras.length} bitácora(s)`);
   } catch (err) {
@@ -1854,7 +2030,7 @@ function renderBanner() {
   document.getElementById('bar-sessions').textContent = data.bitacoras.length;
 
   const lastBita = data.bitacoras[data.bitacoras.length - 1];
-  const ultimoComp = lastBita ? (pick(lastBita, ['componente se centró', 'componente'], { consume: false }) || '—') : '—';
+  const ultimoComp = lastBita ? (getComponent(lastBita) || '—') : '—';
   setHoverStat('card-component', 'bar-component', 'bar-component-hover', ultimoComp, 60);
 }
 
@@ -1997,7 +2173,7 @@ function renderPrediagnostico() {
   const ubicacion = [ciudad, depto].filter(Boolean).join(' · ') || null;
 
   const lastBita = data.bitacoras[data.bitacoras.length - 1];
-  const ultimoComp = lastBita ? (pick(lastBita, ['componente se centró', 'componente'], { consume: false }) || null) : null;
+  const ultimoComp = lastBita ? (getComponent(lastBita) || null) : null;
   const ultimosProximos = lastBita ? (pick(lastBita, ['Próximos pasos definidos para el emprendedor', 'Próximos pasos'], { consume: false }) || null) : null;
 
   const customResolvers = {
@@ -2090,44 +2266,21 @@ function renderBitacoras() {
 
   document.getElementById('bitas-count').textContent = data.bitacoras.length;
 
-  // Verificar si alguna bitácora tiene número de sesión válido (1-9)
-  // Si ninguna lo tiene, asignar posición ordinal: 1ª bitácora = Sesión 1, etc.
-  const hasValidNums = data.bitacoras.some(b => {
-    const n = getSessionNum(b);
-    return !isNaN(n) && n >= 1 && n <= 9;
-  });
-
-  // Mapa: número de sesión → bitácora
-  if (!hasValidNums && data.bitacoras.length > 0) {
-    // Asignación ordinal: la 1ª bitácora recibe sesión 1, la 2ª sesión 2, etc.
-    data.bitacoras.forEach((b, idx) => {
-      b.__sessionFallback = idx + 1;
-    });
-  }
-
-  function resolveSessionNum(b, idx) {
-    if (b.__sessionFallback != null) return b.__sessionFallback;
-    const n = getSessionNum(b);
-    return (!isNaN(n) && n >= 1 && n <= 9) ? n : (idx + 1);
-  }
-
-  const sessionsWithData = new Set();
-  data.bitacoras.forEach((b, idx) => {
-    const n = resolveSessionNum(b, idx);
-    if (n >= 1 && n <= 3) sessionsWithData.add(n);
-  });
-
-  // Guardar mapa sesión→bitácora para selectBitaSession
+  // El mapa se construye con el orden cronológico preparado al recibir la respuesta
+  // de Power Automate. No depende del campo "Número de sesión" del formulario.
   window._bitaSessionMap = {};
-  data.bitacoras.forEach((b, idx) => {
-    const n = resolveSessionNum(b, idx);
-    if (!window._bitaSessionMap[n]) window._bitaSessionMap[n] = b;
+  data.bitacoras.forEach((row, index) => {
+    const sessionNum = getResolvedSessionNum(row, index);
+    if (sessionNum <= 3 && !window._bitaSessionMap[sessionNum]) {
+      window._bitaSessionMap[sessionNum] = row;
+    }
   });
 
-  const maxSessions = Math.max(3, data.bitacoras.length);
-  const tabCount = Math.min(maxSessions, 3);
+  const sessionsWithData = new Set(Object.keys(window._bitaSessionMap).map(Number));
 
-  for (let i = 1; i <= tabCount; i++) {
+  // Founders Hub contempla hasta tres sesiones. Las pestañas siempre se mantienen
+  // visibles para que el mentor entienda el avance de la ruta.
+  for (let i = 1; i <= 3; i++) {
     const tab = el('button', {
       class: 'fh-bita-tab' + (sessionsWithData.has(i) ? ' has-data' : ''),
       attrs: { 'data-session': i }
@@ -2138,8 +2291,7 @@ function renderBitacoras() {
     tabsEl.appendChild(tab);
   }
 
-  // Seleccionar la primera sesión con datos, o la 1 por defecto
-  const firstWithData = [...sessionsWithData].sort((a,b)=>a-b)[0] || 1;
+  const firstWithData = [...sessionsWithData].sort((a, b) => a - b)[0] || 1;
   selectBitaSession(firstWithData);
 }
 
@@ -2175,6 +2327,15 @@ function bitaSection(icon, title, fields, openByDefault = false) {
         const wrap = el('div', { class: 'fh-tags' });
         wrap.appendChild(el('span', { class: 'fh-tag', text: String(f.value) }));
         field.appendChild(wrap);
+      } else if (f.link && isLikelyUrl(f.value)) {
+        const link = el('a', {
+          class: 'fh-field-val',
+          text: String(f.linkText || 'Abrir documento'),
+          attrs: { href: String(f.value).trim(), target: '_blank', rel: 'noopener noreferrer' }
+        });
+        link.style.color = 'var(--fh-teal-dark)';
+        link.style.fontWeight = '800';
+        field.appendChild(link);
       } else {
         field.appendChild(el('div', { class: 'fh-field-val' + (f.long ? ' long' : ''), text: String(f.value) }));
       }
@@ -2233,9 +2394,7 @@ function selectBitaSession(num) {
     t.classList.toggle('active', parseInt(t.dataset.session) === num);
   });
 
-  // Usar mapa si existe (fallback ordinal), si no buscar por número de sesión
-  const bita = (window._bitaSessionMap && window._bitaSessionMap[num])
-    || data.bitacoras.find(b => getSessionNum(b) === num);
+  const bita = window._bitaSessionMap ? window._bitaSessionMap[num] : null;
   const content = document.getElementById('bita-content');
   content.innerHTML = '';
 
@@ -2245,17 +2404,23 @@ function selectBitaSession(num) {
     ic.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>';
     empty.appendChild(ic);
     empty.appendChild(el('h4', { text: `Sesión ${num} aún no registrada` }));
-    empty.appendChild(el('p', { text: 'El mentor anterior no ha diligenciado la bitácora correspondiente a esta sesión, o esta sesión todavía no ha ocurrido.' }));
+    empty.appendChild(el('p', { text: 'No existe todavía una bitácora anterior para esta posición de la ruta. Cuando se registre una nueva respuesta para la misma cédula, aparecerá automáticamente aquí.' }));
     content.appendChild(empty);
     return;
   }
 
-  const fechaRaw = pick(bita, ['Fecha de la sesión'], { consume: false });
+  const fechaRaw = pick(bita, ['Fecha de la sesión', 'Fecha de la sesion'], { consume: false });
   const fecha = formatExcelDate(fechaRaw) || '—';
-  const asesor = pick(bita, ['Nombre del Asesor'], { consume: false }) || '—';
-  const componente = pick(bita, ['componente se centró'], { consume: false }) || 'Componente no registrado';
+  const asesor = pick(bita, ['Nombre del Asesor', 'Nombre del asesor'], { consume: false }) || '—';
+  const processType = getProcessType(bita);
+  const componente = getComponent(bita) || 'Componente no registrado';
+  const especialidadOtro = pick(bita, [
+    'Si seleccionaste Otro, por favor especificar la asesoria especialidad',
+    'Si seleccionaste Otro, por favor especificar la asesoría especialidad',
+    'especificar la asesiria especialidad'
+  ], { consume: false });
   const avance = pick(bita, ['nivel de avance'], { consume: false }) || '—';
-  const etapa = pick(bita, ['etapa se encuentra'], { consume: false });
+  const etapa = pick(bita, ['etapa se encuentra la iniciativa o empresa', 'etapa se encuentra'], { consume: false });
 
   let avanceClass = 'fh-progress-mid';
   const av = String(avance).toLowerCase();
@@ -2267,50 +2432,78 @@ function selectBitaSession(num) {
   hL.appendChild(el('div', { class: 'fh-bita-header-title', text: `Sesión ${num} · ${componente}` }));
   hL.appendChild(el('div', {
     class: 'fh-bita-header-meta',
-    html: `<strong>Fecha:</strong> ${fecha} · <strong>Asesor:</strong> ${asesor}`
+    text: `Fecha: ${fecha} · Asesor: ${asesor}`
   }));
   headerEl.appendChild(hL);
   headerEl.appendChild(el('div', { class: 'fh-progress-pill ' + avanceClass, text: avance }));
   content.appendChild(headerEl);
 
-  // Datos generales
   const dgSec = bitaSection('📋', 'Datos generales de la sesión', [
     { label: 'Asesor', value: asesor },
     { label: 'Fecha', value: fecha },
-    { label: 'Etapa de la iniciativa', value: etapa },
-    { label: 'Número de sesión', value: 'Sesión ' + num },
+    { label: 'Número de sesión asignado automáticamente', value: 'Sesión ' + num },
+    { label: 'Tipo de proceso', value: processType, tag: true },
     { label: 'Componente trabajado', value: componente, tag: true },
+    { label: 'Otra especialidad especificada', value: especialidadOtro },
+    { label: 'Etapa de la iniciativa', value: etapa },
     { label: 'Nivel de avance', value: avance }
   ]);
   if (dgSec) content.appendChild(dgSec);
 
-  // Necesidad y entregable trabajado
-  const necesidad = pick(bita, ['necesidad principal identificada'], { consume: false });
-  const otroNec = pick(bita, ['especificar la necesidad identificada'], { consume: false });
-  const entregable = pick(bita, ['tipo de resultado o entregable'], { consume: false });
-  const otroEnt = pick(bita, ['especificar el resultado definido'], { consume: false });
-  const priorizacion = pick(bita, ['priorización', 'priorizacion'], { consume: false });
+  // Forms repite varias preguntas por ramificación. pick() ahora toma la primera
+  // columna coincidente que realmente tenga una respuesta.
+  const necesidad = pick(bita, [
+    'Cuál fue la necesidad principal trabajada en la sesión',
+    'Cuál fue la necesidad principal identificada en desarrollo de producto',
+    'Cuál fue la necesidad principal identificada en sostenibilidad e impacto',
+    'Cuál fue la necesidad principal identificada'
+  ], { consume: false });
+  const otroNec = pick(bita, [
+    'Si seleccionaste Otro, por favor especificar la necesidad especificada identificada',
+    'Si seleccionaste Otro, por favor especificar la necesidad identificada',
+    'Si seleccionaste Otro, por favor especificar el resultado definido'
+  ], { consume: false });
+  const entregable = pick(bita, [
+    'Qué tipo de resultado o entregable se definió',
+    'Que tipo de resultado o entregable se definio',
+    'Entregable definido'
+  ], { consume: false });
+  const otroEnt = pick(bita, [
+    'Si seleccionaste Otro, por favor especificar el resultado definido'
+  ], { consume: false });
 
-  const necSec = bitaSection('🎯', 'Necesidad y entregable trabajado', [
+  const necSec = bitaSection('🎯', 'Necesidad y resultado trabajado', [
     { label: 'Necesidad principal', value: necesidad },
-    { label: 'Especificación de "Otro" (necesidad)', value: otroNec },
-    { label: 'Entregable definido', value: entregable },
-    { label: 'Especificación de "Otro" (entregable)', value: otroEnt },
-    { label: 'Priorización para próximas sesiones', value: priorizacion }
+    { label: 'Especificación de otra necesidad', value: otroNec },
+    { label: 'Resultado o entregable definido', value: entregable },
+    { label: 'Especificación de otro resultado', value: otroEnt }
   ]);
   if (necSec) content.appendChild(necSec);
 
-  // Resultado y próximos pasos
-  const recomendaciones = pick(bita, ['Recomendaciones brindadas'], { consume: false });
-  const compromisos = pick(bita, ['actividades y compromisos'], { consume: false });
-  const proximos = pick(bita, ['Próximos pasos definidos para el emprendedor', 'Próximos pasos'], { consume: false });
-  const nuevaSesion = pick(bita, ['nueva sesión', 'nueva sesion'], { consume: false });
+  const priorities = collectPriorities(bita);
+  const priSec = bitaSection('🧭', 'Priorización posterior al diagnóstico', [
+    { label: 'Áreas priorizadas para las siguientes sesiones', value: priorities, callout: true }
+  ]);
+  if (priSec) content.appendChild(priSec);
 
-  const resSec = bitaSection('✨', 'Resultado y próximos pasos', [
-    { label: '📝 Recomendaciones brindadas', value: recomendaciones, callout: true },
+  const diagnostico = pick(bita, [
+    'Diagnostico Emprendedor',
+    'Diagnóstico Emprendedor',
+    'describe el diagnóstico de la iniciativa'
+  ], { consume: false });
+  const recomendaciones = pick(bita, ['Recomendaciones brindadas'], { consume: false });
+  const compromisos = pick(bita, ['actividades y compromisos fueron asignadas', 'actividades y compromisos'], { consume: false });
+  const proximos = pick(bita, ['Próximos pasos definidos para el emprendedor', 'Próximos pasos'], { consume: false });
+  const nuevaSesion = pick(bita, ['Se requiere una nueva sesión', 'nueva sesión', 'nueva sesion'], { consume: false });
+  const transcription = getTranscriptionLink(bita);
+
+  const resSec = bitaSection('✨', 'Diagnóstico, compromisos y seguimiento', [
+    { label: '🔎 Diagnóstico del emprendimiento', value: diagnostico, callout: true },
     { label: '✅ Actividades y compromisos asignados', value: compromisos, callout: true },
+    { label: '📝 Recomendaciones brindadas', value: recomendaciones, callout: true },
     { label: '▶ Próximos pasos para el emprendedor', value: proximos, callout: true },
-    { label: '¿Se requiere nueva sesión?', value: nuevaSesion }
+    { label: '¿Se requiere nueva sesión?', value: nuevaSesion },
+    { label: 'Transcripción o notas de la sesión', value: transcription, link: true, linkText: 'Abrir transcripción o notas' }
   ]);
   if (resSec) content.appendChild(resSec);
 }
